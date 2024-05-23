@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"strings"
 
@@ -68,34 +69,35 @@ var specialTypes = map[string]*apiext.JSONSchemaProps{
 	},
 	"google.protobuf.DoubleValue": {
 		Type:     "number",
+		Format:   "double",
 		Nullable: true,
 	},
 	"google.protobuf.Int32Value": {
 		Type:     "integer",
+		Format:   "int32",
 		Nullable: true,
-		// Min: math.MinInt32,
-		// Max: math.MaxInt32,
 	},
 	"google.protobuf.Int64Value": {
 		Type:     "integer",
+		Format:   "int64",
 		Nullable: true,
-		// Min: math.MinInt64,
-		// Max: math.MaxInt64,
 	},
 	"google.protobuf.UInt32Value": {
 		Type:     "integer",
+		Minimum:  Ptr(float64(0)),
+		Maximum:  Ptr(float64(math.MaxUint32)),
 		Nullable: true,
-		// Min: 0,
-		// Max: math.MaxUInt32,
 	},
 	"google.protobuf.UInt64Value": {
-		Type:     "integer",
+		Type:    "integer",
+		Minimum: Ptr(float64(0)),
+		// TODO: this overflows Kubernetes
+		// schema.Maximum = Ptr(float64(uint64(math.MaxUint64)))
 		Nullable: true,
-		// Min: 0,
-		// Max: math.MaxUInt62,
 	},
 	"google.protobuf.FloatValue": {
 		Type:     "number",
+		Format:   "double",
 		Nullable: true,
 	},
 	"google.protobuf.Duration": {
@@ -302,7 +304,23 @@ func (g *openapiGenerator) generateFile(
 	for name, cfg := range genTags {
 		log.Println("Generating", name)
 		group := cfg["groupName"]
-		version := cfg["version"]
+
+		versionsString := cfg["versions"]
+		versions := strings.Split(versionsString, ",")
+		var storageVersion string
+		if version := cfg["version"]; version != "" {
+			if len(versions) == 0 {
+				log.Fatal("can only set versions or version")
+			}
+			if _, f := cfg["storageVersion"]; f {
+				// Old way: single version specifies explicitly
+				storageVersion = version
+			}
+			versions = []string{version}
+		} else {
+			// New way: first one is the storage version
+			storageVersion = versions[0]
+		}
 		kind := name[strings.LastIndex(name, ".")+1:]
 		singular := strings.ToLower(kind)
 		plural := singular + "s"
@@ -321,13 +339,6 @@ func (g *openapiGenerator) generateFile(
 			ListKind: kind + "List",
 			Plural:   plural,
 			Singular: singular,
-		}
-		ver := apiext.CustomResourceDefinitionVersion{
-			Name:   version,
-			Served: true,
-			Schema: &apiext.CustomResourceValidation{
-				OpenAPIV3Schema: schema,
-			},
 		}
 
 		if res, f := cfg["resource"]; f {
@@ -349,83 +360,95 @@ func (g *openapiGenerator) generateFile(
 			}
 		}
 		name := names.Plural + "." + group
-		if pk, f := cfg["printerColumn"]; f {
-			pcs := strings.Split(pk, ";;")
-			for _, pc := range pcs {
-				if pc == "" {
-					continue
+		for _, version := range versions {
+			ver := apiext.CustomResourceDefinitionVersion{
+				Name:   version,
+				Served: true,
+				Schema: &apiext.CustomResourceValidation{
+					OpenAPIV3Schema: schema,
+				},
+			}
+			if pk, f := cfg["printerColumn"]; f {
+				pcs := strings.Split(pk, ";;")
+				for _, pc := range pcs {
+					if pc == "" {
+						continue
+					}
+					column := apiext.CustomResourceColumnDefinition{}
+					for n, m := range extractKeyValue(pc) {
+						switch n {
+						case "name":
+							column.Name = m
+						case "type":
+							column.Type = m
+						case "description":
+							column.Description = m
+						case "JSONPath":
+							column.JSONPath = m
+						}
+					}
+					ver.AdditionalPrinterColumns = append(ver.AdditionalPrinterColumns, column)
 				}
-				column := apiext.CustomResourceColumnDefinition{}
-				for n, m := range extractKeyValue(pc) {
-					switch n {
-					case "name":
-						column.Name = m
-					case "type":
-						column.Type = m
-					case "description":
-						column.Description = m
-					case "JSONPath":
-						column.JSONPath = m
+			}
+			if sr, f := cfg["subresource"]; f {
+				if sr == "status" {
+					ver.Subresources = &apiext.CustomResourceSubresources{Status: &apiext.CustomResourceSubresourceStatus{}}
+					ver.Schema.OpenAPIV3Schema.Properties["status"] = apiext.JSONSchemaProps{
+						Type:                   "object",
+						XPreserveUnknownFields: Ptr(true),
 					}
 				}
-				ver.AdditionalPrinterColumns = append(ver.AdditionalPrinterColumns, column)
 			}
-		}
-		if sr, f := cfg["subresource"]; f {
-			if sr == "status" {
-				ver.Subresources = &apiext.CustomResourceSubresources{Status: &apiext.CustomResourceSubresourceStatus{}}
-				ver.Schema.OpenAPIV3Schema.Properties["status"] = apiext.JSONSchemaProps{
-					Type:                   "object",
-					XPreserveUnknownFields: Ptr(true),
+			if sr, f := cfg["spec"]; f {
+				if sr == "required" {
+					ver.Schema.OpenAPIV3Schema.Required = append(ver.Schema.OpenAPIV3Schema.Required, "spec")
 				}
 			}
-		}
-		if sr, f := cfg["spec"]; f {
-			if sr == "required" {
-				ver.Schema.OpenAPIV3Schema.Required = append(ver.Schema.OpenAPIV3Schema.Required, "spec")
+			if version == storageVersion {
+				ver.Storage = true
 			}
-		}
-		if _, f := cfg["storageVersion"]; f {
-			ver.Storage = true
-		}
-		if r, f := cfg["deprecationReplacement"]; f {
-			msg := fmt.Sprintf("%v version %q is deprecated, use %q", name, ver.Name, r)
-			ver.Deprecated = true
-			ver.DeprecationWarning = &msg
-		}
-		if err := validateStructural(ver.Schema.OpenAPIV3Schema); err != nil {
-			log.Fatalf("failed to validate %v as structural: %v", kind, err)
-		}
+			if r, f := cfg["deprecationReplacement"]; f {
+				msg := fmt.Sprintf("%v version %q is deprecated, use %q", name, ver.Name, r)
+				ver.Deprecated = true
+				ver.DeprecationWarning = &msg
+			}
+			if err := validateStructural(ver.Schema.OpenAPIV3Schema); err != nil {
+				log.Fatalf("failed to validate %v as structural: %v", kind, err)
+			}
 
-		crd, f := crds[name]
-		if !f {
-			crd = &apiext.CustomResourceDefinition{
-				TypeMeta: metav1.TypeMeta{
-					APIVersion: "apiextensions.k8s.io/v1",
-					Kind:       "CustomResourceDefinition",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Annotations: extractKeyValue(cfg["annotations"]),
-					Labels:      extractKeyValue(cfg["labels"]),
-					Name:        name,
-				},
-				Spec: apiext.CustomResourceDefinitionSpec{
-					Group: group,
-					Names: names,
-					Scope: apiext.NamespaceScoped,
-				},
-				Status: apiext.CustomResourceDefinitionStatus{},
+			crd, f := crds[name]
+			if !f {
+				crd = &apiext.CustomResourceDefinition{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "apiextensions.k8s.io/v1",
+						Kind:       "CustomResourceDefinition",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: extractKeyValue(cfg["annotations"]),
+						Labels:      extractKeyValue(cfg["labels"]),
+						Name:        name,
+					},
+					Spec: apiext.CustomResourceDefinitionSpec{
+						Group: group,
+						Names: names,
+						Scope: apiext.NamespaceScoped,
+					},
+					Status: apiext.CustomResourceDefinitionStatus{},
+				}
 			}
-		}
 
-		crd.Spec.Versions = append(crd.Spec.Versions, ver)
-		crds[name] = crd
-		slices.SortFunc(crd.Spec.Versions, func(a, b apiext.CustomResourceDefinitionVersion) int {
-			if a.Name < b.Name {
-				return -1
-			}
-			return 1
-		})
+			crd.Spec.Versions = append(crd.Spec.Versions, ver)
+			crds[name] = crd
+			slices.SortFunc(crd.Spec.Versions, func(a, b apiext.CustomResourceDefinitionVersion) int {
+				if a.Name == b.Name {
+					log.Fatalf("%v has the version %v twice", name, a.Name)
+				}
+				if a.Name < b.Name {
+					return -1
+				}
+				return 1
+			})
+		}
 	}
 
 	// sort the configs so that the order is deterministic.
@@ -712,19 +735,26 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *apiext.
 
 	case descriptor.FieldDescriptorProto_TYPE_INT64, descriptor.FieldDescriptorProto_TYPE_SINT64, descriptor.FieldDescriptorProto_TYPE_SFIXED64:
 		schema.Type = "integer"
-		// TODO:
-		// schema.Format = "int64"
+		schema.Format = "int64"
+		// TODO: ideally we could use a string here to avoid https://github.com/istio/api/issues/2818
+		// however, IntOrString is an int32.
 		// schema.XIntOrString = true
 		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_UINT64, descriptor.FieldDescriptorProto_TYPE_FIXED64:
 		schema.Type = "integer"
-		// TODO: schema.Format = "int64" schema.XIntOrString = true
+		schema.Minimum = Ptr(float64(0))
+		// TODO: this overflows Kubernetes
+		// schema.Maximum = Ptr(float64(uint64(math.MaxUint64)))
+		// TODO: ideally we could use a string here to avoid https://github.com/istio/api/issues/2818
+		// however, IntOrString is an int32.
+		// schema.XIntOrString = true
 		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_UINT32, descriptor.FieldDescriptorProto_TYPE_FIXED32:
 		schema.Type = "integer"
-		// TODO: schema.Format = "int32"
+		schema.Minimum = Ptr(float64(0))
+		schema.Maximum = Ptr(float64(math.MaxUint32))
 		schema.Description = g.generateDescription(field)
 
 	case descriptor.FieldDescriptorProto_TYPE_BOOL:
@@ -761,7 +791,21 @@ func (g *openapiGenerator) fieldType(field *protomodel.FieldDescriptor) *apiext.
 	case descriptor.FieldDescriptorProto_TYPE_ENUM:
 		enum := field.FieldType.(*protomodel.EnumDescriptor)
 		schema = g.generateEnumSchema(enum)
-		schema.Description = g.generateDescription(field)
+		desc := g.generateDescription(field)
+		// Add all options to the description
+		valid := []string{}
+		for i, v := range enum.Values {
+			n := v.GetName()
+			// Allow skipping the default value if its a bogus value.
+			if i == 0 && (strings.Contains(n, "UNSPECIFIED") ||
+				strings.Contains(n, "UNSET") ||
+				strings.Contains(n, "UNDEFINED") ||
+				strings.Contains(n, "INVALID")) {
+				continue
+			}
+			valid = append(valid, n)
+		}
+		schema.Description = desc + fmt.Sprintf("\n\nValid Options: %v", strings.Join(valid, ", "))
 	}
 
 	if field.IsRepeated() && !isMap {
